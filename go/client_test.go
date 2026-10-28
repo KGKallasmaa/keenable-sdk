@@ -731,6 +731,68 @@ func TestSlowBodyInsideDeadline(t *testing.T) {
 	}
 }
 
+func TestNilClientDoesNotPanic(t *testing.T) {
+	var client *keenable.Client
+	if client.Keyless() {
+		t.Fatal("nil client is not keyless")
+	}
+	if _, err := client.Search(context.Background(), "q", nil); !errors.As(err, new(*keenable.InvalidRequestError)) {
+		t.Fatal(err)
+	}
+	if _, err := client.Fetch(context.Background(), "https://example.com"); !errors.As(err, new(*keenable.InvalidRequestError)) {
+		t.Fatal(err)
+	}
+	if (*keenable.SearchResponse)(nil).ToContext(nil) != "" {
+		t.Fatal("nil response should render nothing")
+	}
+	if (*keenable.SearchResponse)(nil).Cited(nil) != nil {
+		t.Fatal("nil response has no citations")
+	}
+	if (*keenable.Page)(nil).ToContext(nil) != "" {
+		t.Fatal("nil page should render nothing")
+	}
+}
+
+func TestCustomHTTPClientTimeoutIsTheDeadlineWeName(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		jsonHandler(http.StatusOK, searchBody).ServeHTTP(w, r)
+	})
+	optsTimeout := 5 * time.Second
+	httpTimeout := 40 * time.Millisecond
+	c, _ := startKeyless(t, h, &keenable.Options{
+		Timeout:    optsTimeout,
+		HTTPClient: &http.Client{Timeout: httpTimeout},
+	})
+	_, err := c.Search(context.Background(), "q", nil)
+	var conn *keenable.ConnectionError
+	if !errors.As(err, &conn) {
+		t.Fatal(err)
+	}
+	if !strings.Contains(err.Error(), httpTimeout.String()) {
+		t.Fatal(err)
+	}
+	if strings.Contains(err.Error(), optsTimeout.String()) {
+		t.Fatal("named the Options timeout instead of the http.Client timeout")
+	}
+}
+
+func TestLocalErrorsNameTheFix(t *testing.T) {
+	c, _ := startKeyless(t, jsonHandler(http.StatusOK, searchBody), nil)
+	_, err := c.Search(context.Background(), "  ", nil)
+	if !strings.Contains(err.Error(), "query argument") {
+		t.Fatal(err)
+	}
+	_, err = c.Fetch(context.Background(), "http://127.0.0.1/")
+	if !strings.Contains(err.Error(), "public http(s) URL") {
+		t.Fatal(err)
+	}
+	_, err = keenable.RunToolCall(context.Background(), c, "nope", "{}")
+	if !strings.Contains(err.Error(), "keenable_search") {
+		t.Fatal(err)
+	}
+}
+
 func searchToolProperties(t *testing.T) map[string]any {
 	t.Helper()
 	raw, err := json.Marshal(keenable.SearchTool)

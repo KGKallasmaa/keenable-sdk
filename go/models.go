@@ -87,6 +87,9 @@ type Page struct {
 // Index 0 is the source the model cites as [1]. Listing Results instead would
 // number sources the model never saw once the budget trimmed them.
 func (r *SearchResponse) Cited(opts *ContextOptions) []SearchResult {
+	if r == nil {
+		return nil
+	}
 	maxChars := contextMaxChars(opts)
 	includeDates := contextIncludeDates(opts)
 	selected := r.Results
@@ -130,6 +133,9 @@ func (r *SearchResponse) Cited(opts *ContextOptions) []SearchResult {
 // Results are added whole until the budget is reached, so a trimmed context
 // never ends mid-sentence.
 func (r *SearchResponse) ToContext(opts *ContextOptions) string {
+	if r == nil {
+		return ""
+	}
 	includeDates := contextIncludeDates(opts)
 	cited := r.Cited(opts)
 	parts := make([]string, 0, len(cited))
@@ -148,6 +154,9 @@ func (r *SearchResponse) ToContext(opts *ContextOptions) string {
 // at the budget instead of dropped. The publication date is included when
 // the page has one.
 func (p *Page) ToContext(opts *ContextOptions) string {
+	if p == nil {
+		return ""
+	}
 	maxChars := contextMaxChars(opts)
 	header := sourceHeader(1, p.Title, p.URL, p.PublishedAt, true)
 	budget := maxChars - utf8.RuneCountInString(header) - 1

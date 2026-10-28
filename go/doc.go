@@ -9,7 +9,7 @@
 //	}
 //	defer client.Close()
 //
-//	results, err := client.Search(ctx, "fastest inference providers 2026", nil)
+//	results, err := client.Search(context.Background(), "fastest inference providers 2026", nil)
 //	if err != nil {
 //		log.Fatal(err)
 //	}

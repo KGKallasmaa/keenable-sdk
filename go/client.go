@@ -100,9 +100,9 @@ func New(opts *Options) (*Client, error) {
 	}
 	if opts.HTTPClient != nil {
 		c.http = opts.HTTPClient
-		if opts.HTTPClient.Timeout > 0 {
-			c.timeout = opts.HTTPClient.Timeout
-		}
+		// The supplied client's Timeout is the only deadline this SDK did not
+		// create. Name that one in errors. Zero means it has no deadline.
+		c.timeout = opts.HTTPClient.Timeout
 		return c, nil
 	}
 	c.http = &http.Client{Timeout: timeout}
@@ -119,7 +119,8 @@ func (c *Client) Close() {
 }
 
 // Keyless reports whether the public tier is in use.
-func (c *Client) Keyless() bool { return c.apiKey == "" }
+// A nil client reports false.
+func (c *Client) Keyless() bool { return c != nil && c.apiKey == "" }
 
 // Search queries the web and returns ranked pages with extracted text.
 //
@@ -127,11 +128,14 @@ func (c *Client) Keyless() bool { return c.apiKey == "" }
 // Vue performance") rather than keywords. The index is semantic.
 // opts may be nil.
 func (c *Client) Search(ctx context.Context, query string, opts *SearchOptions) (*SearchResponse, error) {
+	if err := requireClient(c); err != nil {
+		return nil, err
+	}
 	if err := requireContext(ctx); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(query) == "" {
-		return nil, &InvalidRequestError{msg: "search() needs a non-empty query"}
+		return nil, &InvalidRequestError{msg: "search() needs a non-empty query. Pass the question as the query argument."}
 	}
 	mode := "pro"
 	if opts != nil && opts.Mode != "" {
@@ -158,6 +162,9 @@ func (c *Client) Search(ctx context.Context, query string, opts *SearchOptions) 
 // Use it after Search when a snippet is not enough. Internal hosts and private
 // addresses are refused here, before a request is sent.
 func (c *Client) Fetch(ctx context.Context, pageURL string) (*Page, error) {
+	if err := requireClient(c); err != nil {
+		return nil, err
+	}
 	if err := requireContext(ctx); err != nil {
 		return nil, err
 	}
@@ -169,6 +176,13 @@ func (c *Client) Fetch(ctx context.Context, pageURL string) (*Page, error) {
 		return nil, err
 	}
 	return pageFromJSON(data, pageURL), nil
+}
+
+func requireClient(c *Client) error {
+	if c == nil || c.http == nil {
+		return &InvalidRequestError{msg: "nil client: call keenable.New and use the client it returns"}
+	}
+	return nil
 }
 
 func requireContext(ctx context.Context) error {
@@ -213,7 +227,13 @@ func (c *Client) transportError(ctx context.Context, err error) error {
 		return ctx.Err()
 	}
 	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-		return &ConnectionError{msg: fmt.Sprintf("the Keenable API did not respond within %s", c.timeout)}
+		if c.timeout > 0 {
+			return &ConnectionError{msg: fmt.Sprintf(
+				"the Keenable API did not respond within %s. Raise Options.Timeout or pass a context with a longer deadline.",
+				c.timeout,
+			)}
+		}
+		return &ConnectionError{msg: "the Keenable API did not respond before the request deadline. Set Timeout on the http.Client you passed to New, or drop that client and set Options.Timeout."}
 	}
 	return &ConnectionError{msg: fmt.Sprintf("could not reach the Keenable API: %v", err)}
 }
@@ -317,7 +337,7 @@ func rejectPrivateFetchTarget(raw string) error {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return &InvalidRequestError{msg: fmt.Sprintf("fetch() needs an http(s) URL, got %q", raw)}
+		return &InvalidRequestError{msg: fmt.Sprintf("fetch() needs an http(s) URL, got %q. Use an https URL on the public internet.", raw)}
 	}
 	// A trailing dot resolves to the same host but does not match it as a
 	// string, which is enough to walk past a blocklist.
@@ -326,7 +346,7 @@ func rejectPrivateFetchTarget(raw string) error {
 		return &InvalidRequestError{msg: fmt.Sprintf("fetch() URL has no host: %q", raw)}
 	}
 	if _, blocked := blockedHosts[host]; blocked {
-		return &InvalidRequestError{msg: fmt.Sprintf("refusing to fetch internal host %q", host)}
+		return &InvalidRequestError{msg: fmt.Sprintf("refusing to fetch internal host %q. Pass a public http(s) URL.", host)}
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
@@ -334,7 +354,7 @@ func rejectPrivateFetchTarget(raw string) error {
 	}
 	// ::ffff:127.0.0.1 and ::ffff:7f00:1 reach the same machine as 127.0.0.1.
 	if isNonPublic(addr.Unmap()) {
-		return &InvalidRequestError{msg: fmt.Sprintf("refusing to fetch private address %q", host)}
+		return &InvalidRequestError{msg: fmt.Sprintf("refusing to fetch private address %q. Pass a public http(s) URL.", host)}
 	}
 	return nil
 }
@@ -378,6 +398,14 @@ func toAPIError(status int, raw []byte) error {
 	msg := label
 	if detail != "" {
 		msg = label + ": " + detail
+	}
+	switch status {
+	case 401, 403:
+		msg += ". Check KEENABLE_API_KEY, or pass Options.APIKey."
+	case 402:
+		msg += ". Add credits at https://keenable.ai/console."
+	case 429:
+		msg += ". Set KEENABLE_API_KEY to lift the keyless hourly cap. Create a key at https://keenable.ai/console."
 	}
 	return classifyStatus(status, msg, detail)
 }

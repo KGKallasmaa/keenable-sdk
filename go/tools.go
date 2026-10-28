@@ -90,7 +90,7 @@ func RunToolCall(ctx context.Context, client *Client, name string, arguments any
 	}
 	switch name {
 	case "keenable_search":
-		query, err := requireString(args["query"], "keenable_search needs a 'query'")
+		query, err := requireString(args["query"], "keenable_search needs a 'query'. Pass a JSON object with a query string.")
 		if err != nil {
 			return "", err
 		}
@@ -100,7 +100,7 @@ func RunToolCall(ctx context.Context, client *Client, name string, arguments any
 		}
 		return resp.ToContext(nil), nil
 	case "keenable_fetch":
-		pageURL, err := requireString(args["url"], "keenable_fetch needs a 'url'")
+		pageURL, err := requireString(args["url"], "keenable_fetch needs a 'url'. Pass a JSON object with an https URL.")
 		if err != nil {
 			return "", err
 		}
@@ -110,7 +110,7 @@ func RunToolCall(ctx context.Context, client *Client, name string, arguments any
 		}
 		return page.ToContext(nil), nil
 	default:
-		return "", &InvalidRequestError{msg: fmt.Sprintf("unknown Keenable tool: %q", name)}
+		return "", &InvalidRequestError{msg: fmt.Sprintf("unknown Keenable tool: %q. Use keenable_search or keenable_fetch.", name)}
 	}
 }
 
