@@ -16,6 +16,11 @@ Go 1.22 or newer. The module uses only the standard library.
 That version is the git tag `go/v0.1.0` on `github.com/keenableai/keenable-sdk`
 (the `go/` prefix is the directory, and it is not part of the `@v0.1.0` you
 pass to `go get`). Until that tag exists, `go get` cannot resolve the module.
+From a checkout of this repo, the same program is `example/hello`:
+
+```bash
+cd go && go run ./example/hello
+```
 
 ## Search
 
@@ -151,18 +156,26 @@ this SDK created, and does nothing when you passed your own `http.Client`.
 ## Errors
 
 Every error implements `keenable.Error`, so `errors.As` into that interface
-catches the set. `errors.As` into a concrete type catches one case.
+catches the set. `Code()` is a stable string, and the same token is the last
+parentheses of `Error()`. `errors.As` into a concrete type catches one case.
 `AuthError` and `RateLimitError` unwrap to `APIError`.
 
-| Type | When |
-|---|---|
-| `RateLimitError` | HTTP 429. Set `KEENABLE_API_KEY` to lift the keyless cap |
-| `AuthError` | HTTP 401/403, the key was rejected |
-| `APIError` | Any other non-2xx response; carries `StatusCode` and `Body` |
-| `ConnectionError` | The API could not be reached, or the client deadline elapsed |
-| `InvalidRequestError` | Bad arguments; no request was sent |
+```go
+var sdk keenable.Error
+if errors.As(err, &sdk) {
+    fmt.Println(sdk.Code()) // invalid_request, connection, api_error, auth, rate_limit
+}
+```
 
-HTTP 402 is an `APIError` with the message "Keenable: insufficient credits (402)".
+| Type | Code | When |
+|---|---|---|
+| `RateLimitError` | `rate_limit` | HTTP 429. The message names `X-RateLimit-Reset` when the API sent it. Set `KEENABLE_API_KEY` to lift the keyless cap |
+| `AuthError` | `auth` | HTTP 401/403, the key was rejected |
+| `APIError` | `api_error` | Any other non-2xx response; carries `StatusCode`, `Body`, and `RequestID` when the API sent `X-Request-Id` |
+| `ConnectionError` | `connection` | The API could not be reached, or the client deadline elapsed |
+| `InvalidRequestError` | `invalid_request` | Bad arguments; no request was sent |
+
+HTTP 402 is an `APIError` whose message starts "Keenable: insufficient credits (402)" and tells you to add credits.
 
 ## Configuration
 

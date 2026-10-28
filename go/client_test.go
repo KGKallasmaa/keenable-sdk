@@ -731,6 +731,32 @@ func TestSlowBodyInsideDeadline(t *testing.T) {
 	}
 }
 
+func TestErrorCarriesCodeAndRequestID(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "req_test")
+		w.Header().Set("X-RateLimit-Limit", "1000")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", "2026-10-28T14:52:48.084Z")
+		jsonHandler(http.StatusTooManyRequests, map[string]any{"message": "hourly cap reached"}).ServeHTTP(w, r)
+	})
+	c, _ := startKeyless(t, h, nil)
+	_, err := c.Search(context.Background(), "q", nil)
+	var rate *keenable.RateLimitError
+	if !errors.As(err, &rate) {
+		t.Fatal(err)
+	}
+	if rate.Code() != keenable.CodeRateLimit || rate.RequestID != "req_test" || rate.Reset == "" || rate.Limit != 1000 {
+		t.Fatalf("%s limit=%d reset=%q id=%q", err, rate.Limit, rate.Reset, rate.RequestID)
+	}
+	if !strings.Contains(err.Error(), "req_test") || !strings.Contains(err.Error(), "Retry after 2026-10-28T14:52:48.084Z") || !strings.Contains(err.Error(), "(rate_limit)") {
+		t.Fatal(err)
+	}
+	var sdk keenable.Error
+	if !errors.As(err, &sdk) || sdk.Code() != keenable.CodeRateLimit {
+		t.Fatal(err)
+	}
+}
+
 func TestNilClientDoesNotPanic(t *testing.T) {
 	var client *keenable.Client
 	if client.Keyless() {

@@ -82,7 +82,7 @@ func newSearchTool() ToolDefinition {
 // page the way it cites a search result.
 func RunToolCall(ctx context.Context, client *Client, name string, arguments any) (string, error) {
 	if client == nil {
-		return "", &InvalidRequestError{msg: "RunToolCall needs a client"}
+		return "", &InvalidRequestError{msg: "RunToolCall needs a client. Call keenable.New and pass that client."}
 	}
 	args, err := parseArguments(arguments)
 	if err != nil {
@@ -132,7 +132,7 @@ func parseArguments(arguments any) (map[string]any, error) {
 		return decodeToolArgs([]byte(v))
 	default:
 		return nil, &InvalidRequestError{msg: fmt.Sprintf(
-			"tool call arguments must be a JSON string or an object, got %T",
+			"tool call arguments must be a JSON string or an object, got %T. Pass the function arguments JSON.",
 			arguments,
 		)}
 	}
@@ -142,14 +142,14 @@ func decodeToolArgs(raw []byte) (map[string]any, error) {
 	var parsed any
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, &InvalidRequestError{msg: fmt.Sprintf(
-			"tool call arguments are not valid JSON: %q",
+			"tool call arguments are not valid JSON: %q. Pass a JSON object such as {\"query\":\"...\"}.",
 			string(raw),
 		)}
 	}
 	obj, ok := parsed.(map[string]any)
 	if !ok {
 		return nil, &InvalidRequestError{msg: fmt.Sprintf(
-			"tool call arguments must be a JSON object, got %q",
+			"tool call arguments must be a JSON object, got %q. Pass an object, not an array or a scalar.",
 			string(raw),
 		)}
 	}

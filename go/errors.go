@@ -1,12 +1,24 @@
 package keenable
 
+// Stable codes an agent can switch on. They are also the last parentheses
+// of Error().
+const (
+	CodeInvalidRequest = "invalid_request"
+	CodeConnection     = "connection"
+	CodeAPI            = "api_error"
+	CodeAuth           = "auth"
+	CodeRateLimit      = "rate_limit"
+)
+
 // Error is implemented by every error this package returns.
 //
 // errors.As into Error catches the whole set, the way except KeenableError
 // does in the other SDKs. errors.As into a concrete type catches one case.
+// Code is stable. The human sentence is Error().
 type Error interface {
 	error
 	keenableError()
+	Code() string
 }
 
 // InvalidRequestError means the arguments were rejected locally.
@@ -15,7 +27,13 @@ type InvalidRequestError struct {
 	msg string
 }
 
-func (e *InvalidRequestError) Error() string  { return e.msg }
+func (e *InvalidRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.msg + " (" + CodeInvalidRequest + ")"
+}
+func (e *InvalidRequestError) Code() string   { return CodeInvalidRequest }
 func (e *InvalidRequestError) keenableError() {}
 
 // ConnectionError means the API could not be reached, or the client deadline
@@ -25,7 +43,13 @@ type ConnectionError struct {
 	msg string
 }
 
-func (e *ConnectionError) Error() string  { return e.msg }
+func (e *ConnectionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.msg + " (" + CodeConnection + ")"
+}
+func (e *ConnectionError) Code() string   { return CodeConnection }
 func (e *ConnectionError) keenableError() {}
 
 // APIError is a non-2xx response.
@@ -35,10 +59,31 @@ func (e *ConnectionError) keenableError() {}
 type APIError struct {
 	StatusCode int
 	Body       string
-	msg        string
+	// RequestID is the API's X-Request-Id, when the response sent one.
+	RequestID string
+	msg       string
+	code      string
 }
 
-func (e *APIError) Error() string  { return e.msg }
+func (e *APIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	msg := e.msg
+	if e.RequestID != "" {
+		msg += " (request_id: " + e.RequestID + ")"
+	}
+	return msg + " (" + e.Code() + ")"
+}
+func (e *APIError) Code() string {
+	if e == nil {
+		return ""
+	}
+	if e.code == "" {
+		return CodeAPI
+	}
+	return e.code
+}
 func (e *APIError) keenableError() {}
 
 // AuthError means the API key was rejected (HTTP 401 or 403).
@@ -57,8 +102,13 @@ func (e *AuthError) Unwrap() error {
 //
 // Keyless calls share a lower hourly cap. Set KEENABLE_API_KEY to lift it.
 // A key is never required to make a request.
+// Reset is the API's X-RateLimit-Reset value when it sent one, so a retry
+// knows when the window opens.
 type RateLimitError struct {
 	*APIError
+	Limit     int
+	Remaining int
+	Reset     string
 }
 
 func (e *RateLimitError) Unwrap() error {

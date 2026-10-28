@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -148,7 +149,7 @@ func (c *Client) Search(ctx context.Context, query string, opts *SearchOptions) 
 	applyFilters(payload, opts)
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, &InvalidRequestError{msg: "could not encode the search request"}
+		return nil, &InvalidRequestError{msg: "could not encode the search request. Retry with a string query."}
 	}
 	data, err := c.do(ctx, http.MethodPost, "search", body, "")
 	if err != nil {
@@ -203,7 +204,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, f
 	}
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 	if err != nil {
-		return nil, &InvalidRequestError{msg: err.Error()}
+		return nil, &InvalidRequestError{msg: "could not build the request: " + err.Error() + ". Check Options.BaseURL or KEENABLE_API_URL."}
 	}
 	req.Header = c.headers(body != nil)
 
@@ -217,9 +218,9 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, f
 		return nil, c.transportError(ctx, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, toAPIError(resp.StatusCode, raw)
+		return nil, toAPIError(resp.StatusCode, raw, resp.Header)
 	}
-	return decodeObject(resp.StatusCode, raw)
+	return decodeObject(resp.StatusCode, raw, resp.Header)
 }
 
 func (c *Client) transportError(ctx context.Context, err error) error {
@@ -235,7 +236,7 @@ func (c *Client) transportError(ctx context.Context, err error) error {
 		}
 		return &ConnectionError{msg: "the Keenable API did not respond before the request deadline. Set Timeout on the http.Client you passed to New, or drop that client and set Options.Timeout."}
 	}
-	return &ConnectionError{msg: fmt.Sprintf("could not reach the Keenable API: %v", err)}
+	return &ConnectionError{msg: fmt.Sprintf("could not reach the Keenable API: %v. Check KEENABLE_API_URL and retry.", err)}
 }
 
 func isTimeout(err error) bool {
@@ -333,7 +334,7 @@ var blockedHosts = map[string]struct{}{
 func rejectPrivateFetchTarget(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return &InvalidRequestError{msg: fmt.Sprintf("fetch() needs an http(s) URL, got %q", raw)}
+		return &InvalidRequestError{msg: fmt.Sprintf("fetch() needs an http(s) URL, got %q. Use an https URL on the public internet.", raw)}
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
@@ -343,7 +344,7 @@ func rejectPrivateFetchTarget(raw string) error {
 	// string, which is enough to walk past a blocklist.
 	host := normalizeHost(u.Hostname())
 	if host == "" {
-		return &InvalidRequestError{msg: fmt.Sprintf("fetch() URL has no host: %q", raw)}
+		return &InvalidRequestError{msg: fmt.Sprintf("fetch() URL has no host: %q. Pass an https URL with a public host.", raw)}
 	}
 	if _, blocked := blockedHosts[host]; blocked {
 		return &InvalidRequestError{msg: fmt.Sprintf("refusing to fetch internal host %q. Pass a public http(s) URL.", host)}
@@ -383,7 +384,7 @@ var statusLabels = map[int]string{
 	429: "Keenable rate limit exceeded (429)",
 }
 
-func toAPIError(status int, raw []byte) error {
+func toAPIError(status int, raw []byte, header http.Header) error {
 	detail := ""
 	var body any
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -406,20 +407,58 @@ func toAPIError(status int, raw []byte) error {
 		msg += ". Add credits at https://keenable.ai/console."
 	case 429:
 		msg += ". Set KEENABLE_API_KEY to lift the keyless hourly cap. Create a key at https://keenable.ai/console."
+		if reset := headerValue(header, "X-RateLimit-Reset"); reset != "" {
+			msg += " Retry after " + reset + "."
+		}
+	default:
+		msg += ". Retry the request. If it keeps failing, confirm KEENABLE_API_URL."
 	}
-	return classifyStatus(status, msg, detail)
+	return classifyStatus(status, msg, detail, header)
 }
 
-func classifyStatus(status int, msg, body string) error {
-	api := &APIError{StatusCode: status, Body: body, msg: msg}
+func classifyStatus(status int, msg, body string, header http.Header) error {
+	code := CodeAPI
+	switch status {
+	case 401, 403:
+		code = CodeAuth
+	case 429:
+		code = CodeRateLimit
+	}
+	api := &APIError{
+		StatusCode: status,
+		Body:       body,
+		RequestID:  headerValue(header, "X-Request-Id"),
+		msg:        msg,
+		code:       code,
+	}
 	switch status {
 	case 401, 403:
 		return &AuthError{APIError: api}
 	case 429:
-		return &RateLimitError{APIError: api}
+		return &RateLimitError{
+			APIError:  api,
+			Limit:     headerInt(header, "X-RateLimit-Limit"),
+			Remaining: headerInt(header, "X-RateLimit-Remaining"),
+			Reset:     headerValue(header, "X-RateLimit-Reset"),
+		}
 	default:
 		return api
 	}
+}
+
+func headerValue(h http.Header, key string) string {
+	if h == nil {
+		return ""
+	}
+	return strings.TrimSpace(h.Get(key))
+}
+
+func headerInt(h http.Header, key string) int {
+	n, err := strconv.Atoi(headerValue(h, key))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func firstDetail(m map[string]any, keys ...string) string {
@@ -442,23 +481,28 @@ func firstDetail(m map[string]any, keys ...string) string {
 	return ""
 }
 
-func decodeObject(status int, raw []byte) (map[string]any, error) {
+func decodeObject(status int, raw []byte, header http.Header) (map[string]any, error) {
 	snippet := raw
 	if len(snippet) > 200 {
 		snippet = snippet[:200]
 	}
+	id := headerValue(header, "X-Request-Id")
 	var data any
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return nil, &APIError{
 			StatusCode: status,
-			msg:        fmt.Sprintf("Keenable API returned a non-JSON response: %q", string(snippet)),
+			RequestID:  id,
+			code:       CodeAPI,
+			msg:        fmt.Sprintf("Keenable API returned a non-JSON response: %q. Retry the request. If it keeps failing, confirm KEENABLE_API_URL.", string(snippet)),
 		}
 	}
 	obj, ok := data.(map[string]any)
 	if !ok {
 		return nil, &APIError{
 			StatusCode: status,
-			msg:        fmt.Sprintf("Unexpected response from the Keenable API: %q", string(snippet)),
+			RequestID:  id,
+			code:       CodeAPI,
+			msg:        fmt.Sprintf("Unexpected response from the Keenable API: %q. Retry the request. If it keeps failing, confirm KEENABLE_API_URL.", string(snippet)),
 		}
 	}
 	return obj, nil
