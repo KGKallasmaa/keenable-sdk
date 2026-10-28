@@ -570,7 +570,7 @@ func TestNonJSONAndNonObjectBodies(t *testing.T) {
 func TestBaseURLValidation(t *testing.T) {
 	t.Setenv("KEENABLE_API_KEY", "")
 	t.Setenv("KEENABLE_API_URL", "")
-	for _, raw := range []string{"ftp://api.keenable.ai", "http://api.keenable.ai", ""} {
+	for _, raw := range []string{"ftp://api.keenable.ai", "http://api.keenable.ai", "", "https://api.keenable.ai?tenant=x", "https://api.keenable.ai#section"} {
 		_, err := keenable.New(&keenable.Options{BaseURL: &raw})
 		if !errors.As(err, new(*keenable.InvalidRequestError)) {
 			t.Fatalf("%q: %v", raw, err)
@@ -795,11 +795,147 @@ func TestCustomHTTPClientTimeoutIsTheDeadlineWeName(t *testing.T) {
 	if !errors.As(err, &conn) {
 		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), httpTimeout.String()) {
+	if !strings.Contains(err.Error(), httpTimeout.String()) || !strings.Contains(err.Error(), "http.Client") {
 		t.Fatal(err)
 	}
-	if strings.Contains(err.Error(), optsTimeout.String()) {
-		t.Fatal("named the Options timeout instead of the http.Client timeout")
+	if strings.Contains(err.Error(), optsTimeout.String()) || strings.Contains(err.Error(), "pass a context") {
+		t.Fatal(err)
+	}
+}
+
+func TestSuppliedClientStillHonorsOptionsTimeout(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		jsonHandler(http.StatusOK, searchBody).ServeHTTP(w, r)
+	})
+	timeout := 40 * time.Millisecond
+	hc := &http.Client{}
+	c, _ := startKeyless(t, h, &keenable.Options{
+		Timeout:    timeout,
+		HTTPClient: hc,
+	})
+	_, err := c.Search(context.Background(), "q", nil)
+	var conn *keenable.ConnectionError
+	if !errors.As(err, &conn) || !strings.Contains(err.Error(), timeout.String()) || !strings.Contains(err.Error(), "Options.Timeout") {
+		t.Fatal(err)
+	}
+	if hc.Timeout != 0 || hc.CheckRedirect != nil {
+		t.Fatal("New mutated the supplied http.Client")
+	}
+}
+
+func TestBaseURLPathIsPreserved(t *testing.T) {
+	seen, handler := capture(jsonHandler(http.StatusOK, searchBody))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	base := srv.URL + "/prefix"
+	empty := ""
+	c, err := keenable.New(&keenable.Options{BaseURL: &base, APIKey: &empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	if _, err := c.Search(context.Background(), "q", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := one(t, seen).Path; got != "/prefix/v1/search/public" {
+		t.Fatal(got)
+	}
+}
+
+func TestCrossHostRedirectDoesNotSendTheAPIKey(t *testing.T) {
+	var hits int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("X-API-Key") != "" {
+			t.Error("API key was forwarded")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"query":"q","results":[]}`))
+	}))
+	t.Cleanup(other.Close)
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/stolen", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(api.Close)
+
+	key := "keen_secret"
+	base := api.URL
+	userCalled := false
+	hc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		userCalled = true
+		return nil
+	}}
+	c, err := keenable.New(&keenable.Options{APIKey: &key, BaseURL: &base, HTTPClient: hc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	_, err = c.Search(context.Background(), "q", nil)
+	if hits != 0 {
+		t.Fatalf("followed the redirect, hits=%d", hits)
+	}
+	if userCalled {
+		t.Fatal("caller CheckRedirect ran for a cross-host redirect")
+	}
+	if err == nil || strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "redirect") {
+		t.Fatal(err)
+	}
+	var conn *keenable.ConnectionError
+	if !errors.As(err, &conn) {
+		t.Fatal(err)
+	}
+}
+
+func TestSameHostRedirectKeepsTheAPIKey(t *testing.T) {
+	var saw string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("ok") == "" {
+			http.Redirect(w, r, srv.URL+r.URL.Path+"?ok=1", http.StatusTemporaryRedirect)
+			return
+		}
+		saw = r.Header.Get("X-API-Key")
+		jsonHandler(http.StatusOK, searchBody).ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	key := "keen_secret"
+	base := srv.URL
+	c, err := keenable.New(&keenable.Options{APIKey: &key, BaseURL: &base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	if _, err := c.Search(context.Background(), "q", nil); err != nil {
+		t.Fatal(err)
+	}
+	if saw != key {
+		t.Fatalf("same-host redirect dropped the key: %q", saw)
+	}
+}
+
+func TestKeyedRateLimitDoesNotAskForAKey(t *testing.T) {
+	var sawKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawKey = r.Header.Get("X-API-Key")
+		jsonHandler(http.StatusTooManyRequests, map[string]any{"message": "slow down"}).ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	key := "keen_test"
+	base := srv.URL
+	c, err := keenable.New(&keenable.Options{APIKey: &key, BaseURL: &base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	_, err = c.Search(context.Background(), "q", nil)
+	if sawKey != key {
+		t.Fatalf("request key %q", sawKey)
+	}
+	var rate *keenable.RateLimitError
+	if !errors.As(err, &rate) || strings.Contains(err.Error(), "KEENABLE_API_KEY") || !strings.Contains(err.Error(), "window") {
+		t.Fatal(err)
 	}
 }
 

@@ -145,22 +145,32 @@ stay on `Search` for you to set yourself.
 
 Pass the request's `context.Context`. Canceling it returns `ctx.Err()`
 (`context.Canceled` or `context.DeadlineExceeded`), not a connection error.
+Those two values do not implement `keenable.Error`.
 
-`Options.Timeout` (default 30s) covers response headers and the body. When that
-deadline fires and the caller's context is still live, the error is a
-`ConnectionError` whose message names the deadline.
+`Options.Timeout` (default 30s) covers response headers and the body when this
+SDK creates the HTTP client. A positive `Options.Timeout` also applies when
+you pass your own `http.Client`, and it does not change that client. When the
+SDK deadline fires and the caller's context is still live, the error is a
+`ConnectionError` that tells you to raise `Options.Timeout`. When the deadline
+that fires is `http.Client.Timeout`, the message tells you to raise that
+instead.
 
 There is one client. Reuse it. `Close` drops idle connections on the client
 this SDK created, and does nothing when you passed your own `http.Client`.
 
 ## Errors
 
-Every error implements `keenable.Error`, so `errors.As` into that interface
-catches the set. `Code()` is a stable string, and the same token is the last
+SDK errors implement `keenable.Error`. `errors.As` into that interface
+catches them. `Code()` is a stable string, and the same token is the last
 parentheses of `Error()`. `errors.As` into a concrete type catches one case.
 `AuthError` and `RateLimitError` unwrap to `APIError`.
 
+A caller context that ended is not one of those errors. Check it first:
+
 ```go
+if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+    return err
+}
 var sdk keenable.Error
 if errors.As(err, &sdk) {
     fmt.Println(sdk.Code()) // invalid_request, connection, api_error, auth, rate_limit
@@ -169,7 +179,7 @@ if errors.As(err, &sdk) {
 
 | Type | Code | When |
 |---|---|---|
-| `RateLimitError` | `rate_limit` | HTTP 429. The message names `X-RateLimit-Reset` when the API sent it. Set `KEENABLE_API_KEY` to lift the keyless cap |
+| `RateLimitError` | `rate_limit` | HTTP 429. The message names `X-RateLimit-Reset` when the API sent it. A keyless call is told to set `KEENABLE_API_KEY`. A keyed call is told to wait for the window |
 | `AuthError` | `auth` | HTTP 401/403, the key was rejected |
 | `APIError` | `api_error` | Any other non-2xx response; carries `StatusCode`, `Body`, and `RequestID` when the API sent `X-Request-Id` |
 | `ConnectionError` | `connection` | The API could not be reached, or the client deadline elapsed |
@@ -195,7 +205,10 @@ client, err := keenable.New(&keenable.Options{APIKey: &key})
 ```
 
 `BaseURL` must be `https`, except `http` to `localhost`, `127.0.0.1`, or `::1`.
-`Timeout` of zero means 30 seconds. `ClientSource` is sent as
+It cannot include a query string or a fragment. `Timeout` of zero means 30
+seconds when this SDK creates the HTTP client. When you pass `HTTPClient`,
+zero adds no extra deadline and that client's `Timeout` is left unchanged.
+`ClientSource` is sent as
 `X-Keenable-Title`; empty means "Keenable SDK". Set it when you wrap this SDK
 and want your own traffic attribution.
 

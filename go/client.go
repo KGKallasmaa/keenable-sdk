@@ -47,15 +47,20 @@ type Options struct {
 	// BaseURL overrides KEENABLE_API_URL. Must be https, except http to
 	// localhost, 127.0.0.1, or ::1.
 	BaseURL *string
-	// Timeout is the deadline for headers and body. Zero means [DefaultTimeout].
-	// A caller context that ends sooner wins. The client deadline surfaces as
-	// [ConnectionError]; a canceled context is returned as ctx.Err().
+	// Timeout is the deadline for headers and body. Zero means [DefaultTimeout]
+	// when this SDK creates the HTTP client. When HTTPClient is set, zero adds
+	// no extra deadline and that client's Timeout is left unchanged. A positive
+	// Timeout always applies, through the request context, without mutating
+	// HTTPClient. A caller context that ends sooner wins and is returned as
+	// ctx.Err(). An SDK or HTTP-client deadline is a [ConnectionError].
 	Timeout time.Duration
 	// ClientSource is sent as X-Keenable-Title. Empty means "Keenable SDK".
 	// Set it when you wrap this SDK and want your own traffic attribution.
 	ClientSource string
 	// HTTPClient replaces the owned client (proxies, custom transports).
-	// Its Timeout is left alone, and [Client.Close] does not close it.
+	// Its Timeout and CheckRedirect are left alone, and [Client.Close] does
+	// not close it. Cross-host redirects are still refused, so X-API-Key is
+	// not sent to another host.
 	HTTPClient *http.Client
 }
 
@@ -71,9 +76,16 @@ type Client struct {
 	apiKey       string
 	baseURL      string
 	clientSource string
-	timeout      time.Duration
-	http         *http.Client
-	ownsClient   bool
+	// sdkTimeout is applied as a request context deadline. Zero means this SDK
+	// adds none, which happens only when the caller supplied an HTTP client
+	// and left Options.Timeout at zero.
+	sdkTimeout time.Duration
+	// clientTimeout is the Timeout of a caller-supplied http.Client. It is
+	// zero when this SDK owns the client, or when the supplied client has no
+	// deadline of its own.
+	clientTimeout time.Duration
+	http          *http.Client
+	ownsClient    bool
 }
 
 // New builds a client. A nil opts reads the environment and uses the defaults.
@@ -89,24 +101,25 @@ func New(opts *Options) (*Client, error) {
 	if source == "" {
 		source = defaultClientSource
 	}
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = DefaultTimeout
-	}
 	c := &Client{
 		apiKey:       resolveAPIKey(opts.APIKey),
 		baseURL:      base,
 		clientSource: source,
-		timeout:      timeout,
 	}
 	if opts.HTTPClient != nil {
 		c.http = opts.HTTPClient
-		// The supplied client's Timeout is the only deadline this SDK did not
-		// create. Name that one in errors. Zero means it has no deadline.
-		c.timeout = opts.HTTPClient.Timeout
+		c.clientTimeout = opts.HTTPClient.Timeout
+		if opts.Timeout > 0 {
+			c.sdkTimeout = opts.Timeout
+		}
 		return c, nil
 	}
-	c.http = &http.Client{Timeout: timeout}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	c.sdkTimeout = timeout
+	c.http = &http.Client{Timeout: timeout, CheckRedirect: ownedCheckRedirect}
 	c.ownsClient = true
 	return c, nil
 }
@@ -202,39 +215,120 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, f
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
+	reqCtx := ctx
+	if c.sdkTimeout > 0 {
+		var stop context.CancelFunc
+		reqCtx, stop = context.WithTimeout(ctx, c.sdkTimeout)
+		defer stop()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, reader)
 	if err != nil {
 		return nil, &InvalidRequestError{msg: "could not build the request: " + err.Error() + ". Check Options.BaseURL or KEENABLE_API_URL."}
 	}
 	req.Header = c.headers(body != nil)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.requestClient().Do(req)
 	if err != nil {
-		return nil, c.transportError(ctx, err)
+		return nil, c.transportError(ctx, reqCtx, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, c.transportError(ctx, err)
+		return nil, c.transportError(ctx, reqCtx, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, toAPIError(resp.StatusCode, raw, resp.Header)
+		return nil, toAPIError(resp.StatusCode, raw, resp.Header, c.Keyless())
 	}
 	return decodeObject(resp.StatusCode, raw, resp.Header)
 }
 
-func (c *Client) transportError(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
+// requestClient applies the redirect guard. A caller-supplied client is cloned
+// so its Timeout and CheckRedirect fields stay as the caller set them.
+func (c *Client) requestClient() *http.Client {
+	if c.ownsClient {
+		return c.http
+	}
+	clone := *c.http
+	user := c.http.CheckRedirect
+	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := refuseCrossHostRedirect(req, via); err != nil {
+			return err
+		}
+		if user != nil {
+			return user(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &clone
+}
+
+func ownedCheckRedirect(req *http.Request, via []*http.Request) error {
+	if err := refuseCrossHostRedirect(req, via); err != nil {
+		return err
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+type crossHostRedirectError struct {
+	to string
+}
+
+func (e *crossHostRedirectError) Error() string {
+	return "refusing to follow a redirect to " + e.to
+}
+
+// refuseCrossHostRedirect drops X-API-Key and stops the redirect when the
+// next hop is a different host or scheme. Go strips Authorization on those
+// hops and leaves a custom header in place, which would send the API key away.
+func refuseCrossHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 || req == nil || req.URL == nil || via[0].URL == nil {
+		return nil
+	}
+	initial := via[0].URL
+	if strings.EqualFold(initial.Scheme, req.URL.Scheme) && strings.EqualFold(initial.Host, req.URL.Host) {
+		return nil
+	}
+	req.Header.Del("X-API-Key")
+	return &crossHostRedirectError{to: req.URL.Host}
+}
+
+func (c *Client) transportError(caller, reqCtx context.Context, err error) error {
+	if caller.Err() != nil {
+		return caller.Err()
+	}
+	var redirected *crossHostRedirectError
+	if errors.As(err, &redirected) {
+		return &ConnectionError{msg: fmt.Sprintf(
+			"the Keenable API redirected to %s. The redirect was not followed, so the API key was not sent. Check KEENABLE_API_URL.",
+			redirected.to,
+		)}
+	}
+	if reqCtx.Err() != nil {
+		return &ConnectionError{msg: fmt.Sprintf(
+			"the Keenable API did not respond within %s. Raise Options.Timeout.",
+			c.sdkTimeout,
+		)}
 	}
 	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-		if c.timeout > 0 {
-			return &ConnectionError{msg: fmt.Sprintf(
-				"the Keenable API did not respond within %s. Raise Options.Timeout or pass a context with a longer deadline.",
-				c.timeout,
-			)}
+		if !c.ownsClient {
+			if c.clientTimeout > 0 {
+				return &ConnectionError{msg: fmt.Sprintf(
+					"the Keenable API did not respond within %s. Raise Timeout on the http.Client you passed to New.",
+					c.clientTimeout,
+				)}
+			}
+			return &ConnectionError{msg: "the Keenable API did not respond before the request deadline. Set Timeout on the http.Client you passed to New, or set Options.Timeout."}
 		}
-		return &ConnectionError{msg: "the Keenable API did not respond before the request deadline. Set Timeout on the http.Client you passed to New, or drop that client and set Options.Timeout."}
+		return &ConnectionError{msg: fmt.Sprintf(
+			"the Keenable API did not respond within %s. Raise Options.Timeout.",
+			c.sdkTimeout,
+		)}
 	}
 	return &ConnectionError{msg: fmt.Sprintf("could not reach the Keenable API: %v. Check KEENABLE_API_URL and retry.", err)}
 }
@@ -260,16 +354,18 @@ func (c *Client) headers(jsonBody bool) http.Header {
 }
 
 func (c *Client) endpointURL(endpoint, fetchURL string) (string, error) {
-	suffix := ""
+	u, err := url.Parse(c.baseURL)
+	if err != nil || u.Host == "" {
+		return "", &InvalidRequestError{msg: fmt.Sprintf("baseURL %q is not a valid URL. Pass an https URL with a host.", c.baseURL)}
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/" + endpoint
 	if c.apiKey == "" {
-		suffix = "/public"
+		u.Path += "/public"
 	}
-	u, err := url.Parse(c.baseURL + "/v1/" + endpoint + suffix)
-	if err != nil {
-		return "", &InvalidRequestError{msg: fmt.Sprintf("baseURL %q is not a valid URL", c.baseURL)}
-	}
+	u.RawQuery = ""
+	u.Fragment = ""
 	if fetchURL != "" {
-		q := u.Query()
+		q := url.Values{}
 		q.Set("url", fetchURL)
 		u.RawQuery = q.Encode()
 	}
@@ -302,6 +398,12 @@ func resolveBaseURL(explicit *string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" {
 		return "", &InvalidRequestError{msg: fmt.Sprintf("baseURL must be an https:// URL with a host, got %q", raw)}
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", &InvalidRequestError{msg: fmt.Sprintf(
+			"baseURL must be an https:// URL with a host and no query or fragment, got %q",
+			raw,
+		)}
 	}
 	scheme := strings.ToLower(u.Scheme)
 	host := normalizeHost(u.Hostname())
@@ -384,7 +486,7 @@ var statusLabels = map[int]string{
 	429: "Keenable rate limit exceeded (429)",
 }
 
-func toAPIError(status int, raw []byte, header http.Header) error {
+func toAPIError(status int, raw []byte, header http.Header, keyless bool) error {
 	detail := ""
 	var body any
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -406,7 +508,11 @@ func toAPIError(status int, raw []byte, header http.Header) error {
 	case 402:
 		msg += ". Add credits at https://keenable.ai/console."
 	case 429:
-		msg += ". Set KEENABLE_API_KEY to lift the keyless hourly cap. Create a key at https://keenable.ai/console."
+		if keyless {
+			msg += ". Set KEENABLE_API_KEY to lift the keyless hourly cap. Create a key at https://keenable.ai/console."
+		} else {
+			msg += ". Wait for the rate limit window to reset, then retry."
+		}
 		if reset := headerValue(header, "X-RateLimit-Reset"); reset != "" {
 			msg += " Retry after " + reset + "."
 		}
